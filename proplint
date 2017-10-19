@@ -1,0 +1,606 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'set'
+
+class Proplint
+
+  # Encodings where a BOM is expected on the file.
+  #TODO: Technically UTF-8 should not be on the list so crack down on that too.
+  BOM_ENCODINGS = [Encoding::UTF_16BE, Encoding::UTF_16LE, Encoding::UTF_32BE, Encoding::UTF_32LE, Encoding::UTF_8].freeze
+
+  # Valid modifiers for keyboard accelerators.
+  VALID_MODIFIERS = ['shift', 'control', 'ctrl', 'meta', 'alt', 'altGraph'].freeze
+
+  # Valid key codes for keyboard accelerators.
+  VALID_KEY_CODES = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 
+                     'ACCEPT', 'ADD', 'AGAIN', 'ALL_CANDIDATES', 'ALPHANUMERIC', 'ALT', 'ALT_GRAPH', 'AMPERSAND', 'ASTERISK', 'AT', 'BACK_QUOTE', 'BACK_SLASH', 'BACK_SPACE', 'BEGIN', 'BRACELEFT',
+                     'BRACERIGHT', 'CANCEL', 'CAPS_LOCK', 'CIRCUMFLEX', 'CLEAR', 'CLOSE_BRACKET', 'CODE_INPUT', 'COLON', 'COMMA', 'COMPOSE', 'CONTEXT_MENU', 'CONTROL', 'CONVERT', 'COPY', 'CUT',
+                     'DEAD_ABOVEDOT', 'DEAD_ABOVERING', 'DEAD_ACUTE', 'DEAD_BREVE', 'DEAD_CARON', 'DEAD_CEDILLA', 'DEAD_CIRCUMFLEX', 'DEAD_DIAERESIS', 'DEAD_DOUBLEACUTE', 'DEAD_GRAVE', 'DEAD_IOTA',
+                     'DEAD_MACRON', 'DEAD_OGONEK', 'DEAD_SEMIVOICED_SOUND', 'DEAD_TILDE', 'DEAD_VOICED_SOUND', 'DECIMAL', 'DELETE', 'DIVIDE', 'DOLLAR', 'DOWN', 'END', 'ENTER', 'EQUALS', 'ESCAPE',
+                     'EURO_SIGN', 'EXCLAMATION_MARK', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14', 'F15', 'F16', 'F17', 'F18', 'F19', 'F20', 'F21', 'F22',
+                     'F23', 'F24', 'FINAL', 'FIND', 'FULL_WIDTH', 'GREATER', 'HALF_WIDTH', 'HELP', 'HIRAGANA', 'HOME', 'INPUT_METHOD_ON_OFF', 'INSERT', 'INVERTED_EXCLAMATION_MARK', 'JAPANESE_HIRAGANA',
+                     'JAPANESE_KATAKANA', 'JAPANESE_ROMAN', 'KANA', 'KANA_LOCK', 'KANJI', 'KATAKANA', 'KP_DOWN', 'KP_LEFT', 'KP_RIGHT', 'KP_UP', 'LEFT', 'LEFT_PARENTHESIS', 'LESS', 'META', 'MINUS',
+                     'MODECHANGE', 'MULTIPLY', 'NONCONVERT', 'NUM_LOCK', 'NUMBER_SIGN', 'NUMPAD0', 'NUMPAD1', 'NUMPAD2', 'NUMPAD3', 'NUMPAD4', 'NUMPAD5', 'NUMPAD6', 'NUMPAD7', 'NUMPAD8', 'NUMPAD9',
+                     'OPEN_BRACKET', 'PAGE_DOWN', 'PAGE_UP', 'PASTE', 'PAUSE', 'PERIOD', 'PLUS', 'PREVIOUS_CANDIDATE', 'PRINTSCREEN', 'PROPS', 'QUOTE', 'QUOTEDBL', 'RIGHT', 'RIGHT_PARENTHESIS',
+                     'ROMAN_CHARACTERS', 'SCROLL_LOCK', 'SEMICOLON', 'SEPARATOR', 'SHIFT', 'SLASH', 'SPACE', 'STOP', 'SUBTRACT', 'TAB', 'UNDEFINED', 'UNDERSCORE', 'UNDO', 'UP', 'WINDOWS'].freeze
+
+  # Mapping of locales to expected CLDR plural categories.
+  # TODO: We shouldn't be hard-coding this
+  LOCALE_PLURAL_CATEGORIES = { 'ar' => ['one', 'two', 'few', 'many', 'other'].freeze,
+                               'da' => ['one', 'other'].freeze,
+                               'de' => ['one', 'other'].freeze,
+                               'es' => ['one', 'other'].freeze,
+                               'fr' => ['one', 'other'].freeze,
+                               'he' => ['one', 'two', 'many', 'other'].freeze,
+                               'iw' => ['one', 'two', 'many', 'other'].freeze,
+                               'ja' => ['other'].freeze,
+                               'ko' => ['other'].freeze,
+                               'nl' => ['one', 'other'].freeze,
+                               'pt' => ['one', 'other'].freeze,
+                               'zh' => ['other'].freeze,
+                               }.freeze
+
+  # Main entry point.
+  #
+  # @param argv [Array] the command-line arguments.
+  def main(argv)
+    if argv.empty?
+      raise "usage: #{$0} <file pattern> ..."
+    end
+
+    files = argv.map { |arg| Dir.glob(arg) }
+                .flatten
+
+    #TODO: Should probably be a command-line argument
+    expected_encoding = 'UTF-8'
+
+    files.each do |file|
+      begin
+        perform_checks(file, expected_encoding)
+      rescue => e
+        raise "Failed on file: #{file}\n#{e.message}"
+      end
+    end
+  end
+
+  # Performs checks on a properties file.
+  #
+  # @param file [String] the path to the file to check.
+  # @param expected_encoding [String] the encoding we expect to be in the file.
+  def perform_checks(file, expected_encoding)
+    if file =~ /[^_]+(?:_([a-z]{2}+)(?:_([A-Z]{2}+|[0-9]{3}+))?)?\.properties/
+      locale_info = { language_code: $1.freeze, country_code: $2.freeze }.freeze
+    else
+      raise "Filename does not fit the usual naming convention: #{file}"
+    end
+
+    file_contents = File.read(file, encoding: expected_encoding)
+    if !file_contents.valid_encoding?
+      raise "File is not encoded in #{expected_encoding}"
+    end
+
+    properties = parse_properties(file_contents)
+
+    if properties.empty?
+      raise 'File contains no properties'
+    end
+
+    properties.each_pair do |key, data|
+      value = data[:value]
+
+      begin
+        check_key(key)
+        check_value(value, locale_info)
+
+        if key.include?('.accelerator.')
+          check_accelerator(value)
+        end
+      rescue => e
+        raise "Failed on key: #{key}\nValue: #{value}\n#{e.message}"
+      end
+    end
+  end
+
+  # Checks a key.
+  #
+  # @param key [String] the key.
+  def check_key(key)
+    if key.include?("\uFEFF")
+      raise 'Key contained U+FEFF, maybe a BOM got into the middle of the file?'
+    end
+  end
+
+  # Checks a value.
+  #
+  # @param key [String] the value.
+  # @param locale_info [Hash] a hash of locale info
+  def check_value(value, locale_info)
+    if value.empty?
+      raise 'Value is empty'
+    end
+
+    if value.include?("\uFFFD")
+      raise 'Value contains U+FFFD, someone probably broke the file encoding when converting formats'
+    end
+
+    if value.include?("\\u")
+      raise 'Value contains \u after unescaping, maybe someone broke a line of HTML in the wrong place?'
+    end
+
+    if value.include?('  ')
+      raise 'Value contains double-spacing'
+    end
+
+    if value =~ /^.+(?<!<html>)\{\d+,plural,/
+      raise 'It looks like this string contains \'clever\' plural usage. Translators are not programmers and do not understand how the format ' +
+            'will be expanded to a complete string. Therefore, you should move the whole sentence to inside the plural format.'
+    end
+
+    #TODO: Detect plurals outside of a plural format
+    #  Something like... /^[^\{]+\{\d+\} \w+s\b(?<!(is|was|does|refers))/
+    # raise 'It looks like this string describes a plural count without containing a proper plural format. ' +
+    #       'Languages other than English have more complicated plural rules than just '1 = singular, more = plural', ' +
+    #       'so even if you think this will always be greater than one, it should have a plural format on it.'
+
+    if value.include?('%s') ||
+       value.include?('%d') ||
+       value.include?('%,d') ||
+       value.include?('%x')
+      raise 'Value contains String.format patterns, but resource bundles should use MessageFormat'
+    end
+
+    if value.include?('{')
+      check_message_format(value, locale_info)
+    end
+  end
+
+  # Checks a value which is supposed to be a keyboard accelerator.
+  #
+  # @param key [String] the value.
+  def check_accelerator(value)
+    state = :maybe_modifiers
+
+    value.split(/\s+/).each do |fragment|
+      case state
+      when :maybe_modifiers
+        if VALID_MODIFIERS.include?(fragment)
+          #TODO: Could ban doubles I guess?
+        else
+          if fragment == 'typed'
+            state = :after_typed
+          elsif fragment == 'pressed' || fragment == 'released'
+            state = :after_pressed
+          elsif VALID_KEY_CODES.include?(fragment)
+            state = :at_end
+          else
+            raise "Invalid key code: <#{fragment}>"
+          end
+        end
+      when :after_typed
+        if fragment.chars.size != 1
+          raise "Typed key can only be a single character but was: <#{fragment}>"
+        else
+          state = :at_end
+        end
+      when :after_pressed
+        if VALID_KEY_CODES.include?(fragment)
+          state = :at_end
+        else
+          raise "Invalid key code: <#{fragment}>"
+        end
+      when :at_end
+        raise "Found tokens past the end: <#{fragment}>"
+      else
+        raise 'Invalid state'
+      end
+    end
+
+    if state != :at_end
+      raise 'No key code specified'
+    end
+
+    #TODO: Mac accelerator checks
+  end
+
+  # Checks a valud which is supposed to be a message format.
+  #
+  # @param key [String] the value.
+  # @param locale_info [Hash] a hash of locale info
+  def check_message_format(value, locale_info)
+    # Removing some other things commonly seen which look like message formats but aren't really.
+    value = value.gsub(/\$\{.*?\}/, '')
+                 .gsub(/\{\{(?:\w+(?:[\/\.]\w+)+\|)?\w+\}\}/, '')
+
+    message_format = parse_message_format(value)
+    message_format.each do |part|
+      if part.is_a?(Hash)
+        param = part[:param]
+        type = part[:type]
+        if type == nil
+          next
+        end
+        style = part[:style]
+
+        case type
+
+        when 'choice'
+          raise 'Choice formats are no longer the way to do plurals. You should use a \',plural,\' format and should pluralise the whole sentence. ' +
+                'If you were using a choice format to do conditional logic, that is a bad idea also and you should just write some code to choose ' +
+                'between multiple strings.'
+
+        when 'plural'
+          plural_style = parse_plural_style(style)
+
+          plural_categories = LOCALE_PLURAL_CATEGORIES[locale_info[:language_code]]
+          if !plural_categories
+            raise "No plural categories are registered for language <#{locale_info[:language_code]}>"
+          end
+
+          expected_categories = Set.new(plural_categories)
+          actual_categories = Set.new(plural_style.keys)
+
+          #TODO: Technically we should be checking the presence of zero against the English originals, but currently we don't have the files available when checking.
+          actual_categories.delete('zero')
+
+          if actual_categories != expected_categories
+            raise "Plural categories present in format <#{actual_categories.to_a}> do not match the expected set <#{expected_categories.to_a}> for language <#{locale_info[:language_code]}>"
+          end
+
+          plural_style.each_pair do |category_keyword, text|
+            check_message_format(text, locale_info)
+          end
+
+        when 'number'
+          if !['integer', 'currency', 'percent'].include?(style)
+            #TODO: Support parsing NumberFormat, or decide to ban it
+            raise "Invalid number style: #{style}"
+          end
+
+        when 'date', 'time'
+          if !['short', 'medium', 'long', 'full'].include?(style)
+            #TODO: Support parsing DateFormat, or decide to ban it
+            raise "Invalid date/time style: #{style}"
+          end
+
+        else
+          raise "Invalid type: #{type}"
+
+        end
+      end
+    end
+  end
+
+  # Parses a message format string to one level deep.
+  #
+  # @param value [String] the format string.
+  # @return [Array] an array of the parts of the string.
+  #         Contains strings for literal content and hashes for parameters.
+  #         Hashes then further contain `:param`, `:type` (optional) and `:style` (optional) keys.
+  def parse_message_format(value)
+    content = []
+
+    state = :in_text
+    depth = 0
+
+    text = ''
+    param_number = ''
+    type = ''
+    style = ''
+
+    value.chars.each_with_index do |ch, index|
+      case state
+
+      when :in_text
+        case ch
+        when '{'
+          content << text
+          text = ''
+          state = :in_param_number
+        when '}'
+          raise "#{index}: Unmatched closing brace, value = #{value}"
+        when '\''
+          state = :in_literal
+        else
+          text += ch
+        end
+
+      when :in_param_number
+        case ch
+        when '}'
+          content << {param: param_number}
+          param_number = ''
+          state = :in_text
+        when ','
+          state = :in_type
+        when /[0-9]/
+          param_number += ch
+        else
+          raise "#{index}: Unexpected character after parameter number: <#{ch}>"
+        end
+
+      when :in_type
+        case ch
+        when '}'
+          content << {param: param_number, type: ''}
+          param_number = ''
+          type = ''
+          state = :in_text
+        when ','
+          state = :in_style
+          depth = 0
+        when /\w/
+          type += ch
+        else
+          raise "#{index}: Unexpected character after format type: <#{ch}>"
+        end
+
+      when :in_style
+        case ch
+        when '}'
+          depth -= 1
+          if depth < 0
+            content << {param: param_number, type: type, style: style}
+            param_number = ''
+            type = ''
+            style = ''
+            state = :in_text
+          else
+            style += ch
+          end
+        when '{'
+          depth += 1
+          style += ch
+        else
+          style += ch
+        end
+
+      when :in_literal
+        if ch == '\''
+          state = :in_text
+          text += ch
+        else
+          text += ch
+        end
+
+      else
+        raise 'Invalid state'
+
+      end
+    end
+
+    case state
+    when :in_text
+      if !text.empty?
+        content << text
+      end
+    when :in_literal
+      raise 'Unclosed apostrophe in message format text. Did you forget to double it?'
+    else
+      raise "Unclosed message format, state = #{state}"
+    end
+
+    content
+  end
+
+  # Parses a plural style pattern.
+  #
+  # @param value [String] the format string.
+  # @return [Hash] a hash of rule keyword => message format mappings.
+  def parse_plural_style(value)
+    content = {}
+
+    state = :before_category_keyword
+    depth = 0
+
+    category_keyword = ''
+    text = ''
+
+    value.chars.each_with_index do |ch, index|
+      case state
+      
+      when :before_category_keyword
+        case ch
+        when '{'
+          raise "#{index}: No category keyword before opening brace, value = #{value}"
+        when '}'
+          raise "#{index}: Unmatched closing brace, value = #{value}"
+        when ' '
+          # ignore it
+        else
+          state = :in_category_keyword
+          category_keyword = ch
+        end
+
+      when :in_category_keyword
+        case ch
+        when '{'
+          state = :in_text
+          depth = 0
+        when '}'
+          raise "#{index}: Unmatched closing brace, value = #{value}"
+        when ' '
+          state = :after_category_keyword
+        else
+          category_keyword += ch
+        end
+
+      when :after_category_keyword
+        case ch
+        when '{'
+          state = :in_text
+          depth = 0
+        when '}'
+          raise "#{index}: Unmatched closing brace, value = #{value}"
+        when ' '
+          # ignore it
+        else
+          raise "#{index}: Expected an opening brace, got <#{ch}>, value = #{value}"
+        end
+
+      when :in_text
+        case ch
+        when '{'
+          depth += 1
+          text += ch
+        when '}'
+          depth -= 1
+          if depth < 0
+            content[category_keyword] = text
+            category_keyword = ''
+            text = ''
+            state = :before_category_keyword
+          else
+            text += ch
+          end
+        else
+          text += ch
+        end
+
+      else
+        raise 'Invalid state'
+
+      end
+    end
+
+    if state != :before_category_keyword || !text.empty? || !category_keyword.empty?
+      raise "Unclosed plural format, state = #{state}"
+    end
+
+    content
+  end
+
+  # Parses Java properties out of the given data.
+  #
+  # @param file_contents [String] The contents of the properties file.
+  # @return [Hash] the properties as a hash.
+  def parse_properties(file_contents)
+    properties = {}
+
+    comment_lines = []
+    continuation_key = nil
+    continuation_value = nil
+
+    if file_contents =~ /^\uFEFF/
+      if BOM_ENCODINGS.include?(file_contents.encoding)
+        file_contents.gsub!(/^\uFEFF/, '')
+      else
+        raise 'Line started with U+FEFF, suspect someone saved the file without cutting off the BOM'
+      end
+    end
+
+    # Converting to UTF-8 eagerly makes it easier to reason about the contents of strings later on.
+    file_contents = file_contents.encode('UTF-8')
+
+    file_contents.each_line do |line|
+      line.chomp!
+
+      if line.rstrip != line
+        #TODO: Should check the start too, but space at the start of continuations is good style so it's a tricky check.
+        raise "Line contains whitespace at the end: <#{line}>"
+      end
+
+      if line == '' || line =~ /^#/
+        comment_lines << line
+        next
+      end
+
+      # These will be nil for the first line of a property definition.
+      key = continuation_key
+      value = continuation_value
+      continuation = !!(line =~ /\\$/)   # lines ending in backslash are continued on the next line
+
+      if key
+        value += unescape(line.lstrip)
+      else
+        #XXX: This only supports = as the separator. Technically the format permits colon or even just space.
+        if line =~ /^(.*?)\s*=\s*(.*?)\\?$/
+          key, value = unescape($1), unescape($2)
+        else
+          raise "Not properties format? Line: <#{line}>"
+        end
+      end
+
+      if continuation
+        continuation_key = key
+        continuation_value = value
+      else
+        if key.strip != key
+          raise "Key contains leading or trailing spaces: " + key
+        end
+        if value.strip != value
+          raise "Value contains leading or trailing spaces: " + value
+        end
+
+        properties[key] = {comment_lines: comment_lines, value: value}
+        comment_lines = []
+        continuation_key = nil
+        continuation_value = nil
+      end
+    end
+
+    properties
+  end
+
+  # Unescapes text.
+  #
+  # @param str [String] the potentially escaped text.
+  # @return [String] the unescaped text.
+  def unescape(str)
+    unesc = ''
+    in_escape_sequence = false
+    in_unicode_sequence = false
+    unicode_sequence = ''
+    str.each_char do |ch|
+      if in_unicode_sequence
+        #TODO: I'm pretty sure this won't handle surrogates correctly.
+        #TODO: Enforce case of Unicode escapes? :)
+        unicode_sequence += ch
+        if unicode_sequence.size == 4
+          unesc += [unicode_sequence.to_i(16)].pack("U")
+          in_unicode_sequence = false
+          in_escape_sequence = false
+          unicode_sequence = ''
+        end
+      elsif in_escape_sequence
+        if ch == 'u'
+          # \uXXXX is a multi-char sequence (the only one) so we need to handle it specially
+          # as it's the only sequence which doesn't require appending something right now.
+          in_unicode_sequence = true
+        else
+          # Every other one terminates the sequence.
+          unesc +=
+            case ch
+            when 'r'
+              "\r"
+            when 'n'
+              "\n"
+            when 'f'
+              "\f"
+            when 't'
+              "\t"
+            when '\\', ' ', '=', ':',      # These are explicitly documented.
+                 '!', '#', '"', "'"        # These are commonly seen but generally don't seem to be a problem.
+              ch
+            else
+              # It is valid to have anything after the escape but this can often point to errors in the files.
+              raise "Unnecessary escape in string: <#{str}>"
+            end
+
+          in_escape_sequence = false
+        end
+      else
+        if ch == "\\"
+          in_escape_sequence = true
+        else
+          unesc += ch
+        end
+      end
+    end
+    unesc
+  end
+end
+
+if __FILE__ == $0
+  Proplint.new.main(ARGV)
+end
